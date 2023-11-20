@@ -951,8 +951,6 @@ sr_query_expr_walker(Node *node, void *context)
 			param->location = Opexpr->location;
 			param->opno = Opexpr->opno;
 			param->opfuncid = Opexpr->opfuncid;
-			// 在生成hash的时候  opfuncid会被假设为0，此时设置为location，为后面重赋值做索引
-			// 这种做法会导致如果模版和当前查询的操作符的位置不同而无法正常替换，即查询语句要写的相同
 			// 注意opfuncid用于执行阶段，因此在此暂时修改不会对规划有影响，但是opno不能随意修改，会用在优化阶段
 			// Opexpr->opfuncid = qp_context->travel_o;
 			Opexpr->location = qp_context->travel_o;
@@ -1240,6 +1238,90 @@ make_tupledesc(ExplainState *es)
 	return tupdesc;
 }
 
+static PlannedStmt *
+lookup_plan_by_query_hash_for_show(Snapshot snapshot, Relation sr_index_rel,
+								   Relation sr_plans_heap, ScanKey key,
+								   void *context,
+								   int index,
+								   char **queryString)
+{
+	int counter = 0;
+	PlannedStmt *pl_stmt = NULL;
+	HeapTuple htup;
+	IndexScanDesc query_index_scan;
+#if PG_VERSION_NUM >= 120000
+	TupleTableSlot *slot = table_slot_create(sr_plans_heap, NULL);
+#endif
+
+	query_index_scan = index_beginscan(sr_plans_heap, sr_index_rel, snapshot, 1, 0);
+	index_rescan(query_index_scan, key, 1, NULL, 0);
+
+#if PG_VERSION_NUM >= 120000
+	while (index_getnext_slot(query_index_scan, ForwardScanDirection, slot))
+#else
+	while ((htup = index_getnext(query_index_scan, ForwardScanDirection)) != NULL)
+#endif
+	{
+		Datum search_values[Anum_sr_attcount];
+		bool search_nulls[Anum_sr_attcount];
+#if PG_VERSION_NUM >= 120000
+		bool shouldFree;
+
+		htup = ExecFetchSlotHeapTuple(slot, false, &shouldFree);
+		Assert(!shouldFree);
+#endif
+
+		heap_deform_tuple(htup, sr_plans_heap->rd_att,
+						  search_values, search_nulls);
+
+		/* Check enabled field or index */
+		counter++;
+		if ((index > 0 && index == counter) ||
+			(index == 0 && DatumGetBool(search_values[Anum_sr_enable - 1])))
+		{
+			char *out = TextDatumGetCString(DatumGetTextP((search_values[Anum_sr_plan - 1])));
+			//	char *query = TextDatumGetCString(DatumGetTextP((search_values[Anum_sr_query - 1])));
+
+			pl_stmt = stringToNode(out);
+
+			if (queryString)
+			{
+				*queryString = TextDatumGetCString(
+					DatumGetTextP((search_values[Anum_sr_query - 1])));
+
+				ListCell *parsetree_item;
+				List *parsetree_list = pg_parse_query(*queryString);
+
+				foreach (parsetree_item, parsetree_list)
+				{
+					RawStmt *parsetree = lfirst_node(RawStmt, parsetree_item);
+					List *querytree_list;
+					querytree_list = pg_analyze_and_rewrite(parsetree, *queryString,
+															NULL, 0, NULL);
+					ListCell *query_list;
+					foreach (query_list, querytree_list)
+					{
+						Query *query = lfirst_node(Query, query_list);
+						struct QueryParamsContext qp_context = {true, 12000, 13000, NULL, NULL};
+
+						sr_query_walker(query, &qp_context);
+						qp_context.collect = false;
+						execute_for_plantree(pl_stmt, restore_params, &qp_context);
+					}
+				}
+			}
+
+			break;
+		}
+	}
+
+	index_endscan(query_index_scan);
+#if PG_VERSION_NUM >= 120000
+	ExecDropSingleTupleTableSlot(slot);
+#endif
+	return pl_stmt;
+}
+
 Datum show_plan(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
@@ -1306,8 +1388,8 @@ Datum show_plan(PG_FUNCTION_ARGS)
 
 		snapshot = RegisterSnapshot(GetLatestSnapshot());
 		ScanKeyInit(&key, 1, BTEqualStrategyNumber, F_INT4EQ, query_hash);
-		pl_stmt = lookup_plan_by_query_hash(snapshot, sr_index_rel, sr_plans_heap,
-											&key, NULL, index, &queryString);
+		pl_stmt = lookup_plan_by_query_hash_for_show(snapshot, sr_index_rel, sr_plans_heap,
+													 &key, NULL, index, &queryString);
 		if (pl_stmt == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
