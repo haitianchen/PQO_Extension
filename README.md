@@ -1,12 +1,10 @@
-[![Build Status](https://travis-ci.org/postgrespro/sr_plan.svg?branch=master)](https://travis-ci.org/postgrespro/sr_plan)
-[![GitHub license](https://img.shields.io/badge/license-PostgreSQL-blue.svg)](https://raw.githubusercontent.com/postgrespro/sr_plan/master/LICENSE)
-
-
-# Save and restore query plans in PostgreSQL
+# Parameterized Queries in PostgreSQL
 
 ## Rationale
 
 sr_plan looks like Oracle Outline system. It can be used to lock the execution plan. It is necessary if you do not trust the planner or able to form a better plan.
+
+**We partially modified it based on sr_plan to support one-to-many binding of queries to plans.**
 
 ## Build and install
 
@@ -16,6 +14,7 @@ make USE_PGXS=1 install
 ```
 
 and modify your postgres config:
+
 ```
 shared_preload_libraries = 'sr_plan'
 ```
@@ -27,6 +26,7 @@ Install the extension in your database:
 ```SQL
 CREATE EXTENSION sr_plan;
 ```
+
 If you want to save the query plan is necessary to set the variable:
 
 ```SQL
@@ -37,11 +37,13 @@ Now plans for all subsequent queries will be stored in the table sr_plans.
 Don't forget that all queries will be stored including duplicates.
 
 Make an example query:
+
 ```SQL
 select query_hash from sr_plans where query_hash=10;
 ```
 
 Disable saving the plan for the query:
+
 ```SQL
 set sr_plan.write_mode = false;
 ```
@@ -52,75 +54,15 @@ Enable it:
 update sr_plans set enable=true;
 ```
 
-After that, the plan for the query will be taken from the sr_plans.
+After that, the plan for the query will be taken from the sr_plans. In addition sr plan allows you to save a parameterized query plan. In this case, we have some constants in the query are not essential. For the arguments, we use a special function _p (anyelement) for binding.
 
-In addition sr plan allows you to save a parameterized query plan.
-In this case, we have some constants in the query are not essential.
-For the parameters we use a special function _p (anyelement) example:
+Suppose we have table a with two columns info and id. we can can bind the parameters using the _p() function.
 
 ```SQL
-select query_hash from sr_plans where query_hash=1000+_p(10);
+select * from a where id = _p(1);
 ```
 
-If we keep the plan for the query and enable it to be used also for the following queries:
-
-```SQL
-select query_hash from sr_plans where query_hash=1000+_p(11);
-select query_hash from sr_plans where query_hash=1000+_p(-5);
-```
-
-## EXPLAIN for saved plans
-
-It is possible to see saved plans by using `show_plan` function. It requires
-knowing query hash which could be fetched from `sr_plans` table.
-
-Examples:
-
-Show enabled plan for query hash:
-
-```SQL
-SELECT show_plan(1);
-                  show_plan                   
-----------------------------------------------
- ("Seq Scan on public.explain_test")
- ("  Output: test_attr1, test_attr2")
- ("  Filter: (explain_test.test_attr1 = 10)")
-(3 rows)
-```
-
-Get second saved plan by using `index` parameter (ignores `enable` attribute):
-
-```SQL
-SELECT show_plan(1, index := 2);
-                  show_plan                   
-----------------------------------------------
- ("Seq Scan on public.explain_test")
- ("  Output: test_attr1, test_attr2")
- ("  Filter: (explain_test.test_attr1 = 10)")
-(3 rows)
-```
-
-Use another output format (supported formats are `json`, `text`, `xml`, `yaml`):
-
-```SQL
-SELECT show_plan(1, format := 'json');
-                      show_plan                       
-------------------------------------------------------
- ("[                                                 +
-   {                                                 +
-     ""Plan"": {                                     +
-       ""Node Type"": ""Seq Scan"",                  +
-       ""Parallel Aware"": false,                    +
-       ""Relation Name"": ""explain_test"",          +
-       ""Schema"": ""public"",                       +
-       ""Alias"": ""explain_test"",                  +
-       ""Output"": [""test_attr1"", ""test_attr2""], +
-       ""Filter"": ""(explain_test.test_attr1 = 10)""+
-     }                                               +
-   }                                                 +
- ]")
-(1 row)
-```
+**Note that the _p() function must be specified as an argument when we want to use a template plan.**
 
 ## `pg_stat_statements` integration
 
