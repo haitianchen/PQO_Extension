@@ -32,6 +32,9 @@ void _PG_fini(void);
 
 static planner_hook_type srplan_planner_hook_next = NULL;
 post_parse_analyze_hook_type srplan_post_parse_analyze_hook_next = NULL;
+static char *ML_host = NULL;
+static int ML_port = 9381;
+static bool ML_enabled = false;
 
 typedef struct SrPlanCachedInfo
 {
@@ -75,7 +78,11 @@ static PlannedStmt *sr_planner(Query *parse, const char *query_string,
 static PlannedStmt *sr_planner(Query *parse, int cursorOptions,
 							   ParamListInfo boundParams);
 #endif
-
+List *lookup_plan_by_query_hash_list(MemoryContext tmpctx, Snapshot snapshot, Relation sr_index_rel,
+									 Relation sr_plans_heap, ScanKey key,
+									 void *context,
+									 int index,
+									 char **queryString);
 static void sr_analyze(ParseState *pstate, Query *query);
 static Oid get_sr_plan_schema(void);
 static Oid sr_get_relname_oid(Oid schema_oid, const char *relname);
@@ -84,6 +91,8 @@ static bool sr_query_expr_walker(Node *node, void *context);
 void walker_callback(void *node);
 static void sr_plan_relcache_hook(Datum arg, Oid relid);
 static Oid getOptName(Oid opno);
+char *get_json_plan(PlannedStmt *pl_stmt);
+
 static void plan_tree_visitor(Plan *plan,
 							  void (*visitor)(Plan *plan, void *context),
 							  void *context);
@@ -92,7 +101,7 @@ static void execute_for_plantree(PlannedStmt *planned_stmt,
 								 void *context);
 static void restore_params(void *context, Plan *plan);
 static Datum get_query_hash(Query *node);
-
+static int connect_to_ML(const char *host, int port);
 static void collect_indexid(void *context, Plan *plan);
 static bool
 sr_query_fake_const_walker(Node *node, void *context);
@@ -257,6 +266,44 @@ is_drop_extension_stmt(Node *stmt)
 		return true;
 
 	return false;
+}
+static int connect_to_ML(const char *host, int port)
+{
+	int ret, conn_fd;
+	struct sockaddr_in server_addr = {0};
+
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_port = htons(port);
+	inet_pton(AF_INET, host, &server_addr.sin_addr);
+	conn_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (conn_fd < 0)
+	{
+		return conn_fd;
+	}
+
+	ret = connect(conn_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+	if (ret == -1)
+	{
+		return ret;
+	}
+
+	return conn_fd;
+}
+
+static void write_all_to_socket(int conn_fd, const char *json)
+{
+	size_t json_length;
+	ssize_t written, written_total;
+	json_length = strlen(json);
+	written_total = 0;
+
+	while (written_total != json_length)
+	{
+		written = write(conn_fd,
+						json + written_total,
+						json_length - written_total);
+		written_total += written;
+	}
 }
 
 static void
@@ -582,6 +629,63 @@ lookup_plan_by_query_hash(Snapshot snapshot, Relation sr_index_rel,
 	return pl_stmt;
 }
 
+List *lookup_plan_by_query_hash_list(MemoryContext tmpctx, Snapshot snapshot, Relation sr_index_rel,
+									 Relation sr_plans_heap, ScanKey key,
+									 void *context,
+									 int index,
+									 char **queryString)
+{
+
+	List *plan_list;
+	PlannedStmt *pl_stmt = NULL;
+	HeapTuple htup;
+	IndexScanDesc query_index_scan;
+
+#if PG_VERSION_NUM >= 120000
+	TupleTableSlot *slot = table_slot_create(sr_plans_heap, NULL);
+#endif
+
+	query_index_scan = index_beginscan(sr_plans_heap, sr_index_rel, snapshot, 1, 0);
+	index_rescan(query_index_scan, key, 1, NULL, 0);
+
+#if PG_VERSION_NUM >= 120000
+	while (index_getnext_slot(query_index_scan, ForwardScanDirection, slot))
+#else
+	while ((htup = index_getnext(query_index_scan, ForwardScanDirection)) != NULL)
+#endif
+	{
+		Datum search_values[Anum_sr_attcount];
+		bool search_nulls[Anum_sr_attcount];
+#if PG_VERSION_NUM >= 120000
+		bool shouldFree;
+
+		htup = ExecFetchSlotHeapTuple(slot, false, &shouldFree);
+		Assert(!shouldFree);
+#endif
+
+		heap_deform_tuple(htup, sr_plans_heap->rd_att,
+						  search_values, search_nulls);
+
+		/* Check enabled field or index */
+		if (DatumGetBool(search_values[Anum_sr_enable - 1]))
+		{
+			char *out = TextDatumGetCString(DatumGetTextP((search_values[Anum_sr_plan - 1])));
+			pl_stmt = stringToNode(out);
+			execute_for_plantree(pl_stmt, restore_params, context);
+			plan_list = lappend(plan_list, pl_stmt);
+		}
+	}
+	index_endscan(query_index_scan);
+	MemoryContext oldctx = CurrentMemoryContext;
+	MemoryContextSwitchTo(tmpctx);
+	plan_list = copyObject((List *)plan_list);
+	MemoryContextSwitchTo(oldctx);
+	return plan_list;
+#if PG_VERSION_NUM >= 120000
+	ExecDropSingleTupleTableSlot(slot);
+#endif
+}
+
 /* planner_hook */
 static PlannedStmt *
 #if PG_VERSION_NUM >= 130000
@@ -606,8 +710,15 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	PlannedStmt *copy_plan = NULL;
 	PlannedStmt *tmp_plan = NULL;
 	MemoryContext tmpctx, oldctx;
+	List *plan_list = NULL;
+	ListCell *plancell = NULL;
+	StringInfo plan_jsons = makeStringInfo();
+	char *syc_sign = "SiGN#";
+	char *syc_end = "e#nd";
+
 #if PG_VERSION_NUM >= 120000
-	TupleTableSlot *slot;
+	TupleTableSlot *
+		slot;
 #endif
 	static int level = 0;
 
@@ -667,9 +778,54 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 
 	qp_context.collect = false;
 	snapshot = RegisterSnapshot(GetLatestSnapshot());
+	int conn_fd;
+	conn_fd = connect_to_ML(ML_host, ML_port);
+	if (conn_fd < 0)
+	{
+		elog(WARNING, "Unable to connect to ML server. ");
+	}
+	if (ML_enabled && conn_fd >= 0)
+	{
+		int plan_order = 0;
+		tmpctx = CurrentMemoryContext;
+		plan_list = lookup_plan_by_query_hash_list(tmpctx, snapshot, sr_index_rel, sr_plans_heap,
+												   &key, &qp_context, 0, NULL);
+		if (list_length(plan_list) != 0)
+		{
 
-	pl_stmt = lookup_plan_by_query_hash(snapshot, sr_index_rel, sr_plans_heap,
-										&key, &qp_context, 0, NULL);
+			foreach (plancell, plan_list)
+			{
+				PlannedStmt *templan = (PlannedStmt *)lfirst(plancell);
+				char *tmp_plan_json = get_json_plan(templan);
+				appendStringInfo(plan_jsons, tmp_plan_json);
+				appendStringInfo(plan_jsons, syc_sign);
+				//
+			}
+			// send json to ml
+			appendStringInfo(plan_jsons, syc_end);
+			write_all_to_socket(conn_fd, plan_jsons->data);
+			shutdown(conn_fd, SHUT_WR);
+
+			// get plan order
+			if (read(conn_fd, &plan_order, sizeof(int)) != sizeof(int))
+			{
+				elog(WARNING, "ML server return wrong value");
+				plan_order = 0;
+			}
+			shutdown(conn_fd, SHUT_RDWR);
+			if (plan_order >= list_length(plan_list))
+			{
+				plan_order = 0;
+				elog(WARNING, "ML server return wrong value that over list len");
+			}
+			pl_stmt = (PlannedStmt *)list_nth(plan_list, plan_order);
+		}
+	}
+	else
+	{
+		pl_stmt = lookup_plan_by_query_hash(snapshot, sr_index_rel, sr_plans_heap,
+											&key, &qp_context, 0, NULL);
+	}
 	if (pl_stmt != NULL)
 	{
 		level--;
@@ -1171,7 +1327,16 @@ void _PG_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
-
+	DefineCustomBoolVariable("ML.enabled",
+							 "Enable ML model select plan.",
+							 NULL,
+							 &ML_enabled,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 	DefineCustomEnumVariable("sr_plan.log_usage",
 							 "Log cached plan usage with specified level",
 							 NULL,
@@ -1183,7 +1348,31 @@ void _PG_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
+	DefineCustomStringVariable(
+		"ML_host",
+		"ML server host",
+		NULL,
+		&ML_host,
+		"localhost",
+		PGC_USERSET,
+		0,
+		NULL,
+		NULL,
+		NULL);
 
+	DefineCustomIntVariable(
+		"ML_port",
+		"ML server port",
+		NULL,
+		&ML_port,
+		9381,
+		1,
+		65536,
+		PGC_USERSET,
+		0,
+		NULL,
+		NULL,
+		NULL);
 	srplan_planner_hook_next = planner_hook;
 	planner_hook = &sr_planner;
 
@@ -1322,6 +1511,31 @@ lookup_plan_by_query_hash_for_show(Snapshot snapshot, Relation sr_index_rel,
 	return pl_stmt;
 }
 
+// get json plan from PlannedStmt
+char *get_json_plan(PlannedStmt *pl_stmt)
+{
+	char *queryString = NULL;
+	char *json;
+	ExplainState *es = NewExplainState();
+	es->analyze = false;
+	es->costs = true;
+	es->verbose = true;
+	es->buffers = false;
+	es->timing = false;
+	es->summary = false;
+	es->format = EXPLAIN_FORMAT_JSON;
+	ExplainBeginOutput(es);
+#if PG_VERSION_NUM >= 130000
+	ExplainOnePlan(pl_stmt, NULL, es, queryString, NULL, NULL, NULL, NULL);
+#elif PG_VERSION_NUM >= 100000
+	ExplainOnePlan(pl_stmt, NULL, es, queryString, NULL, NULL, NULL);
+#else
+	ExplainOnePlan(pl_stmt, NULL, es, queryString, NULL, NULL);
+#endif
+	ExplainEndOutput(es);
+	json = pstrdup(es->str->data);
+	return json;
+}
 Datum show_plan(PG_FUNCTION_ARGS)
 {
 	FuncCallContext *funcctx;
@@ -1352,7 +1566,7 @@ Datum show_plan(PG_FUNCTION_ARGS)
 			index = 0; /* show enabled one */
 
 		es->analyze = false;
-		es->costs = false;
+		es->costs = true;
 		es->verbose = true;
 		es->buffers = false;
 		es->timing = false;
