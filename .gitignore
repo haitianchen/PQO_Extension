@@ -18,6 +18,7 @@ deserialize.c
 serialize.c
 sr_plan_1.c
 sr_plan_ori.c
+sr_plan_debug.c
 sr_plan--1.1.sql
 sr_plan--1.2.sql
 pycparser

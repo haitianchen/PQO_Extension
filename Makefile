@@ -1,7 +1,7 @@
 # contrib/sr_plan/Makefile
 
 MODULE_big = sr_plan
-OBJS = sr_plan.o $(WIN32RES)
+OBJS = sr_plan.o outfuncs_sr.o $(WIN32RES)
 
 PGFILEDESC = "sr_plan - save and read plan"
 
@@ -12,7 +12,6 @@ DATA = sr_plan--1.0--1.1.sql sr_plan--1.1--1.2.sql
 
 EXTRA_CLEAN = sr_plan--$(EXTVERSION).sql
 REGRESS = sr_plan sr_plan_schema joins explain
-
 ifdef USE_PGXS
 ifndef PG_CONFIG
 PG_CONFIG = /data1/chenht/plancache/postgres11.0/install/bin/pg_config
