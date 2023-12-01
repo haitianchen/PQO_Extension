@@ -1,5 +1,5 @@
 # Parameterized Queries in PostgreSQL
-
+Note: Please visit the latest branch to obtain codes. The main branch may be outdated. 
 ## Rationale
 
 sr_plan looks like Oracle Outline system. It can be used to lock the execution plan. It is necessary if you do not trust the planner or able to form a better plan.
