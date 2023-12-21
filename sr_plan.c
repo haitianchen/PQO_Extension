@@ -38,7 +38,7 @@ post_parse_analyze_hook_type srplan_post_parse_analyze_hook_next = NULL;
 static char *ML_host = NULL;
 static int ML_port = 9381;
 static bool ML_enabled = false;
-
+static int sr_count = 2;
 typedef struct SrPlanCachedInfo
 {
     bool enabled;
@@ -85,7 +85,7 @@ List *lookup_plan_by_query_hash_list(MemoryContext tmpctx, Snapshot snapshot, Re
                                      Relation sr_plans_heap, ScanKey key,
                                      void *context,
                                      int index,
-                                     char **queryString);
+                                     char **queryString, int *count);
 static void sr_analyze(ParseState *pstate, Query *query);
 static Oid get_sr_plan_schema(void);
 static Oid sr_get_relname_oid(Oid schema_oid, const char *relname);
@@ -569,7 +569,7 @@ collect_indexid(void *context, Plan *plan)
 {
     plan_tree_visitor(plan, collect_indexid_visitor, context);
 }
-
+// this function do not have count detect
 static PlannedStmt *
 lookup_plan_by_query_hash(Snapshot snapshot, Relation sr_index_rel,
                           Relation sr_plans_heap, ScanKey key,
@@ -636,10 +636,10 @@ List *lookup_plan_by_query_hash_list(MemoryContext tmpctx, Snapshot snapshot, Re
                                      Relation sr_plans_heap, ScanKey key,
                                      void *context,
                                      int index,
-                                     char **queryString)
+                                     char **queryString, int *count)
 {
 
-    List *plan_list;
+    List *plan_list = NULL;
     PlannedStmt *pl_stmt = NULL;
     HeapTuple htup;
     IndexScanDesc query_index_scan;
@@ -670,7 +670,9 @@ List *lookup_plan_by_query_hash_list(MemoryContext tmpctx, Snapshot snapshot, Re
                           search_values, search_nulls);
 
         /* Check enabled field or index */
-        if (DatumGetBool(search_values[Anum_sr_enable - 1]))
+        if (DatumGetInt32(search_values[Anum_sr_query_count - 1]) > *count)
+            *count = DatumGetInt32(search_values[Anum_sr_query_count - 1]);
+        if (DatumGetBool(search_values[Anum_sr_enable - 1]) && DatumGetInt32(search_values[Anum_sr_query_count - 1]) > sr_count)
         {
             char *out = TextDatumGetCString(DatumGetTextP((search_values[Anum_sr_plan - 1])));
             pl_stmt = stringToNode(out);
@@ -718,7 +720,7 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
     StringInfo plan_jsons = makeStringInfo();
     char *syc_sign = "SiGN#";
     char *syc_end = "e#nd";
-
+    int tmp_query_count = 0;
 #if PG_VERSION_NUM >= 120000
     TupleTableSlot *
         slot;
@@ -792,7 +794,7 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
         int plan_order = 0;
         tmpctx = CurrentMemoryContext;
         plan_list = lookup_plan_by_query_hash_list(tmpctx, snapshot, sr_index_rel, sr_plans_heap,
-                                                   &key, &qp_context, 0, NULL);
+                                                   &key, &qp_context, 0, NULL, &tmp_query_count);
         if (list_length(plan_list) != 0)
         {
 
@@ -826,8 +828,10 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
     }
     else
     {
-        pl_stmt = lookup_plan_by_query_hash(snapshot, sr_index_rel, sr_plans_heap,
-                                            &key, &qp_context, 0, NULL);
+        plan_list = lookup_plan_by_query_hash_list(tmpctx, snapshot, sr_index_rel, sr_plans_heap,
+                                                   &key, &qp_context, 0, NULL, &tmp_query_count);
+        if (list_length(plan_list) != 0)
+            pl_stmt = (PlannedStmt *)list_nth(plan_list, 0);
     }
     if (pl_stmt != NULL)
     {
@@ -865,8 +869,8 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 
     /* recheck plan in index */
     snapshot = RegisterSnapshot(GetLatestSnapshot());
-    pl_stmt = lookup_plan_by_query_hash(snapshot, sr_index_rel, sr_plans_heap,
-                                        &key, &qp_context, 0, NULL);
+    //    pl_stmt = lookup_plan_by_query_hash(snapshot, sr_index_rel, sr_plans_heap,
+    // &key, &qp_context, 0, NULL);
     if (pl_stmt != NULL)
     {
         level--;
@@ -878,179 +882,231 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
     level--;
     ///////////////////////////////////////
     // modify*
-
     tmpctx = AllocSetContextCreate(CurrentMemoryContext,
                                    "temporary context",
                                    ALLOCSET_DEFAULT_SIZES);
-    oldctx = MemoryContextSwitchTo(tmpctx);
-    copy_plan = copyObject((PlannedStmt *)pl_stmt);
-    execute_for_plantree(copy_plan, get_template_plan, &qp_context);
-    copy_plan->stmt_len = 0;
-    tmp_plan = pl_stmt;
-    pl_stmt = copy_plan;
-    copy_plan = tmp_plan;
-    ////////////////////////////////
-    plan_text = nodeToString_sr(pl_stmt);
-    plan_hash = hash_any((unsigned char *)plan_text, strlen(plan_text));
 
-    /*
-     * Try to find existing plan for this query and skip addding it
-     * to prevent duplicates.
-     */
-    query_index_scan = index_beginscan(sr_plans_heap, sr_index_rel,
-                                       snapshot, 1, 0);
-    index_rescan(query_index_scan, &key, 1, NULL, 0);
-#if PG_VERSION_NUM >= 120000
-    slot = table_slot_create(sr_plans_heap, NULL);
-#endif
-    found = false;
-    for (;;)
+    oldctx = CurrentMemoryContext;
+
+    if (tmp_query_count < sr_count && tmp_query_count > 0)
     {
-        HeapTuple htup;
-        Datum search_values[Anum_sr_attcount];
-        bool search_nulls[Anum_sr_attcount];
-#if PG_VERSION_NUM >= 120000
-        bool shouldFree;
-
-        if (!index_getnext_slot(query_index_scan, ForwardScanDirection, slot))
-            break;
-
-        htup = ExecFetchSlotHeapTuple(slot, false, &shouldFree);
-        Assert(!shouldFree);
-#else
-        ItemPointer tid = index_getnext_tid(query_index_scan, ForwardScanDirection);
-        if (tid == NULL)
-            break;
-
-        htup = index_fetch_heap(query_index_scan);
-        if (htup == NULL)
-            break;
-#endif
-        heap_deform_tuple(htup, sr_plans_heap->rd_att,
-                          search_values, search_nulls);
-
-        /* Detect full plan duplicate */
-        if (DatumGetInt32(search_values[Anum_sr_plan_hash - 1]) == DatumGetInt32(plan_hash))
+        query_index_scan = index_beginscan(sr_plans_heap, sr_index_rel,
+                                           snapshot, 1, 0);
+        index_rescan(query_index_scan, &key, 1, NULL, 0);
+        for (;;)
         {
-            found = true;
-            break;
+            HeapTuple htup;
+            HeapTuple newhtup;
+            Datum search_values[Anum_sr_attcount];
+            bool search_nulls[Anum_sr_attcount];
+            bool doreplace[Anum_sr_attcount];
+            MemSet(search_nulls, 0, sizeof(search_nulls));
+            MemSet(doreplace, 0, sizeof(doreplace));
+            ItemPointer tid = index_getnext_tid(query_index_scan, ForwardScanDirection);
+            if (tid == NULL)
+                break;
+
+            htup = index_fetch_heap(query_index_scan);
+            if (htup == NULL)
+                break;
+
+            heap_deform_tuple(htup, sr_plans_heap->rd_att,
+                              search_values, search_nulls);
+
+            /* Detect full plan duplicate */
+            if (DatumGetInt32(search_values[Anum_sr_query_count - 1]) < sr_count)
+            {
+                search_values[Anum_sr_query_count - 1] = (Int32GetDatum(DatumGetInt32(search_values[Anum_sr_query_count - 1]) + 1));
+                doreplace[Anum_sr_query_count - 1] = true;
+                newhtup = heap_modify_tuple(htup, sr_plans_heap->rd_att, search_values, search_nulls, doreplace);
+                simple_heap_update(sr_plans_heap, tid, newhtup);
+            }
         }
+        index_endscan(query_index_scan);
     }
-    index_endscan(query_index_scan);
-#if PG_VERSION_NUM >= 120000
-    ExecDropSingleTupleTableSlot(slot);
-#endif
-    if (!found)
+    else
     {
-        struct IndexIds index_ids = {NIL};
 
-        Relation reloids_index_rel;
-        Relation index_reloids_index_rel;
+        copy_plan = copyObject((PlannedStmt *)pl_stmt);
+        execute_for_plantree(copy_plan, get_template_plan, &qp_context);
+        copy_plan->stmt_len = 0;
+        tmp_plan = pl_stmt;
+        pl_stmt = copy_plan;
+        copy_plan = tmp_plan;
+        ////////////////////////////////
+        plan_text = nodeToString_sr(pl_stmt);
+        plan_hash = hash_any((unsigned char *)plan_text, strlen(plan_text));
 
-        ArrayType *reloids = NULL;
-        ArrayType *index_reloids = NULL;
-        Datum values[Anum_sr_attcount];
-        bool nulls[Anum_sr_attcount];
-        int reloids_len = list_length(pl_stmt->relationOids);
-
-        /* prepare indexes */
-        reloids_index_rel = index_open(cachedInfo.reloids_index_oid, heap_lock);
-        index_reloids_index_rel = index_open(cachedInfo.index_reloids_index_oid, heap_lock);
-
-        MemSet(nulls, 0, sizeof(nulls));
-
-        values[Anum_sr_query_hash - 1] = query_hash;
-        values[Anum_sr_query_id - 1] = Int64GetDatum(parse->queryId);
-        values[Anum_sr_plan_hash - 1] = plan_hash;
-        values[Anum_sr_query - 1] = CStringGetTextDatum(cachedInfo.query_text);
-        values[Anum_sr_plan - 1] = CStringGetTextDatum(plan_text);
-        values[Anum_sr_enable - 1] = BoolGetDatum(false);
-        values[Anum_sr_reloids - 1] = (Datum)0;
-        values[Anum_sr_index_reloids - 1] = (Datum)0;
-
-        /* save related oids */
-        if (reloids_len)
+        /*
+         * Try to find existing plan for this query and skip addding it
+         * to prevent duplicates.
+         */
+        query_index_scan = index_beginscan(sr_plans_heap, sr_index_rel,
+                                           snapshot, 1, 0);
+        index_rescan(query_index_scan, &key, 1, NULL, 0);
+#if PG_VERSION_NUM >= 120000
+        slot = table_slot_create(sr_plans_heap, NULL);
+#endif
+        found = false;
+        for (;;)
         {
-            int pos;
-            ListCell *lc;
-            Datum *reloids_arr = palloc(sizeof(Datum) * reloids_len);
+            HeapTuple htup;
+            Datum search_values[Anum_sr_attcount];
+            bool search_nulls[Anum_sr_attcount];
+#if PG_VERSION_NUM >= 120000
+            bool shouldFree;
 
-            pos = 0;
-            foreach (lc, pl_stmt->relationOids)
+            if (!index_getnext_slot(query_index_scan, ForwardScanDirection, slot))
+                break;
+
+            htup = ExecFetchSlotHeapTuple(slot, false, &shouldFree);
+            Assert(!shouldFree);
+#else
+            ItemPointer tid = index_getnext_tid(query_index_scan, ForwardScanDirection);
+            if (tid == NULL)
+                break;
+
+            htup = index_fetch_heap(query_index_scan);
+            if (htup == NULL)
+                break;
+#endif
+            heap_deform_tuple(htup, sr_plans_heap->rd_att,
+                              search_values, search_nulls);
+
+            /* Detect full plan duplicate */
+            if (DatumGetInt32(search_values[Anum_sr_plan_hash - 1]) == DatumGetInt32(plan_hash))
             {
-                reloids_arr[pos] = ObjectIdGetDatum(lfirst_oid(lc));
-                pos++;
+                found = true;
+                break;
             }
-            reloids = construct_array(reloids_arr, reloids_len, OIDOID,
-                                      sizeof(Oid), true, 'i');
-            values[Anum_sr_reloids - 1] = PointerGetDatum(reloids);
-
-            pfree(reloids_arr);
         }
-        else
-            nulls[Anum_sr_reloids - 1] = true;
-
-        /* saved related index oids */
-        execute_for_plantree(pl_stmt, collect_indexid, (void *)&index_ids);
-        if (list_length(index_ids.ids))
+        index_endscan(query_index_scan);
+#if PG_VERSION_NUM >= 120000
+        ExecDropSingleTupleTableSlot(slot);
+#endif
+        if (!found)
         {
-            int len = list_length(index_ids.ids);
-            int pos;
-            ListCell *lc;
-            Datum *ids_arr = palloc(sizeof(Datum) * len);
+            struct IndexIds index_ids = {NIL};
 
-            pos = 0;
-            foreach (lc, index_ids.ids)
+            Relation reloids_index_rel;
+            Relation index_reloids_index_rel;
+
+            ArrayType *reloids = NULL;
+            ArrayType *index_reloids = NULL;
+            Datum values[Anum_sr_attcount];
+            bool nulls[Anum_sr_attcount];
+            int reloids_len = list_length(pl_stmt->relationOids);
+            int datum_q_count = sr_count + 1;
+            /* prepare indexes */
+            reloids_index_rel = index_open(cachedInfo.reloids_index_oid, heap_lock);
+            index_reloids_index_rel = index_open(cachedInfo.index_reloids_index_oid, heap_lock);
+
+            MemSet(nulls, 0, sizeof(nulls));
+            if (tmp_query_count == 0)
             {
-                ids_arr[pos] = ObjectIdGetDatum(lfirst_oid(lc));
-                pos++;
+                values[Anum_sr_plan_hash - 1] = Int64GetDatum(0);
+                values[Anum_sr_plan - 1] = CStringGetTextDatum("Nothing");
+                values[Anum_sr_query_count - 1] = Int64GetDatum(1);
             }
-            index_reloids = construct_array(ids_arr, len, OIDOID,
-                                            sizeof(Oid), true, 'i');
-            values[Anum_sr_index_reloids - 1] = PointerGetDatum(index_reloids);
+            else
+            {
+                values[Anum_sr_plan_hash - 1] = plan_hash;
+                values[Anum_sr_plan - 1] = CStringGetTextDatum(plan_text);
+                values[Anum_sr_query_count - 1] = Int64GetDatum(datum_q_count);
+            }
+            values[Anum_sr_query_hash - 1] = query_hash;
+            values[Anum_sr_query_id - 1] = Int64GetDatum(parse->queryId);
+            values[Anum_sr_query - 1] = CStringGetTextDatum(cachedInfo.query_text);
+            values[Anum_sr_enable - 1] = BoolGetDatum(false);
+            values[Anum_sr_reloids - 1] = (Datum)0;
+            values[Anum_sr_index_reloids - 1] = (Datum)0;
+            MemoryContext _tm = MemoryContextSwitchTo(tmpctx);
 
-            pfree(ids_arr);
-        }
-        else
-            nulls[Anum_sr_index_reloids - 1] = true;
+            /* save related oids */
+            if (reloids_len)
+            {
+                int pos;
+                ListCell *lc;
+                Datum *reloids_arr = palloc(sizeof(Datum) * reloids_len);
 
-        tuple = heap_form_tuple(sr_plans_heap->rd_att, values, nulls);
-        simple_heap_insert(sr_plans_heap, tuple);
+                pos = 0;
+                foreach (lc, pl_stmt->relationOids)
+                {
+                    reloids_arr[pos] = ObjectIdGetDatum(lfirst_oid(lc));
+                    pos++;
+                }
+                reloids = construct_array(reloids_arr, reloids_len, OIDOID,
+                                          sizeof(Oid), true, 'i');
+                values[Anum_sr_reloids - 1] = PointerGetDatum(reloids);
 
-        if (cachedInfo.log_usage)
-            elog(cachedInfo.log_usage, "sr_plan: saved plan for %s", cachedInfo.query_text);
+                pfree(reloids_arr);
+            }
+            else
+                nulls[Anum_sr_reloids - 1] = true;
 
-        index_insert_compat(sr_index_rel,
-                            values, nulls,
-                            &(tuple->t_self),
-                            sr_plans_heap,
-                            UNIQUE_CHECK_NO);
+            /* saved related index oids */
+            execute_for_plantree(pl_stmt, collect_indexid, (void *)&index_ids);
+            if (list_length(index_ids.ids))
+            {
+                int len = list_length(index_ids.ids);
+                int pos;
+                ListCell *lc;
+                Datum *ids_arr = palloc(sizeof(Datum) * len);
 
-        if (reloids)
-        {
-            index_insert_compat(reloids_index_rel,
-                                &values[Anum_sr_reloids - 1],
-                                &nulls[Anum_sr_reloids - 1],
+                pos = 0;
+                foreach (lc, index_ids.ids)
+                {
+                    ids_arr[pos] = ObjectIdGetDatum(lfirst_oid(lc));
+                    pos++;
+                }
+                index_reloids = construct_array(ids_arr, len, OIDOID,
+                                                sizeof(Oid), true, 'i');
+                values[Anum_sr_index_reloids - 1] = PointerGetDatum(index_reloids);
+
+                pfree(ids_arr);
+            }
+            else
+                nulls[Anum_sr_index_reloids - 1] = true;
+
+            tuple = heap_form_tuple(sr_plans_heap->rd_att, values, nulls);
+            simple_heap_insert(sr_plans_heap, tuple);
+
+            if (cachedInfo.log_usage)
+                elog(cachedInfo.log_usage, "sr_plan: saved plan for %s", cachedInfo.query_text);
+
+            index_insert_compat(sr_index_rel,
+                                values, nulls,
                                 &(tuple->t_self),
                                 sr_plans_heap,
                                 UNIQUE_CHECK_NO);
+
+            if (reloids)
+            {
+                index_insert_compat(reloids_index_rel,
+                                    &values[Anum_sr_reloids - 1],
+                                    &nulls[Anum_sr_reloids - 1],
+                                    &(tuple->t_self),
+                                    sr_plans_heap,
+                                    UNIQUE_CHECK_NO);
+            }
+
+            if (index_reloids)
+            {
+                index_insert_compat(index_reloids_index_rel,
+                                    &values[Anum_sr_index_reloids - 1],
+                                    &nulls[Anum_sr_index_reloids - 1],
+                                    &(tuple->t_self),
+                                    sr_plans_heap,
+                                    UNIQUE_CHECK_NO);
+            }
+
+            index_close(reloids_index_rel, heap_lock);
+            index_close(index_reloids_index_rel, heap_lock);
+
+            /* Make changes visible */
+            CommandCounterIncrement();
+            MemoryContextSwitchTo(_tm);
         }
-
-        if (index_reloids)
-        {
-            index_insert_compat(index_reloids_index_rel,
-                                &values[Anum_sr_index_reloids - 1],
-                                &nulls[Anum_sr_index_reloids - 1],
-                                &(tuple->t_self),
-                                sr_plans_heap,
-                                UNIQUE_CHECK_NO);
-        }
-
-        index_close(reloids_index_rel, heap_lock);
-        index_close(index_reloids_index_rel, heap_lock);
-
-        /* Make changes visible */
-        CommandCounterIncrement();
     }
 
 cleanup:

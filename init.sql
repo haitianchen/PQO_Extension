@@ -10,7 +10,7 @@ CREATE TABLE sr_plans (
 	enable		boolean NOT NULL,
 	query		varchar NOT NULL,
 	plan		text NOT NULL,
-
+	query_count int NOT NULL default 0,
 	reloids				oid[],
 	index_reloids		oid[]
 );
