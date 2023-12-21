@@ -10,7 +10,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "miscadmin.h"
-
+#include "cJSON.h"
 #include "postgres.h"
 #include "outfuncs_sr.h"
 #if PG_VERSION_NUM >= 100000
@@ -1834,5 +1834,204 @@ execute_for_plantree(PlannedStmt *planned_stmt,
     {
         Plan *subplan = lfirst(lc);
         proc(context, subplan);
+    }
+}
+/////cost model
+char *get_json_plan_cost(PlannedStmt *pl_stmt)
+{
+    char *queryString = NULL;
+    char *json;
+    ExplainState *es = NewExplainState();
+    es->analyze = false;
+    es->costs = true;
+    es->verbose = true;
+    es->buffers = false;
+    es->timing = false;
+    es->summary = false;
+    es->format = EXPLAIN_FORMAT_JSON;
+    ExplainBeginOutput(es);
+#if PG_VERSION_NUM >= 130000
+    ExplainOnePlan(pl_stmt, NULL, es, queryString, NULL, NULL, NULL, NULL);
+#elif PG_VERSION_NUM >= 100000
+    ExplainOnePlan(pl_stmt, NULL, es, queryString, NULL, NULL, NULL);
+#else
+    ExplainOnePlan(pl_stmt, NULL, es, queryString, NULL, NULL);
+#endif
+    ExplainEndOutput(es);
+    json = pstrdup(es->str->data);
+    cJSON *cjson = cJSON_Parse(json);
+
+    processJson(cjson);
+    char *jsonStr = cJSON_Print(cjson);
+    // 释放内存
+    cJSON_Delete(cjson);
+
+    return jsonStr;
+}
+const char *scanType[] = {"Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Index Scan", "Tid Scan"};
+const char *scanGUC[] = {"enable_seqscan", "enable_indexscan", "enable_indexonlyscan", "enable_bitmapscan", "enable_tidscan"};
+void setGuc(char *scan_type, const char *sql, int *scost, int *tcost, int *rows, int *width)
+{
+    // save old value
+    int c_save_nestlevel = NewGUCNestLevel();
+    int old_value[5] = {0};
+    int arraySize = sizeof(scanType) / sizeof(scanType[0]);
+    for (int i = 0; i < arraySize; i++)
+    {
+        if (strcmp(GetConfigOption(scanGUC[i], true, false), "on"))
+        {
+            old_value[i] = 1;
+        }
+        else
+        {
+            old_value[i] = 0;
+        }
+    }
+
+    for (int i = 0; i < arraySize; i++)
+    {
+        if (strcmp(scanType[i], scan_type) == 0)
+        {
+            set_config_option(scanGUC[i], "true", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+        }
+        else if (i == 2)
+        {
+            if (strcmp(scanType[1], scan_type) == 0)
+            {
+                set_config_option(scanGUC[2], "true", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+            }
+        }
+        else
+        {
+            set_config_option(scanGUC[i], "false", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+        }
+    }
+    // get planstmt
+    RawStmt *c_parsetree = lfirst_node(RawStmt, list_head(pg_parse_query(sql)));
+    List *c_querytree_list;
+    c_querytree_list = pg_analyze_and_rewrite(c_parsetree, sql,
+                                              NULL, 0, NULL);
+    Query *c_query = lfirst_node(Query, list_head(c_querytree_list));
+
+    PlannedStmt *c_plan = standard_planner(c_query, CURSOR_OPT_PARALLEL_OK, NULL);
+
+    *scost = c_plan->planTree->startup_cost;
+    *tcost = c_plan->planTree->total_cost;
+    *rows = c_plan->planTree->plan_rows;
+    *width = c_plan->planTree->plan_width;
+    // reload old guc value
+    for (int i = 0; i < arraySize; i++)
+    {
+        if (old_value[i] == 1)
+        {
+            set_config_option(scanGUC[i], "true", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+        }
+        else
+        {
+            set_config_option(scanGUC[i], "false", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+        }
+    }
+    AtEOXact_GUC(true, c_save_nestlevel);
+    // GetConfigOption(const char *name, bool missing_ok, bool restrict_privileged)
+
+    //  set_config_option("name", "true", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+}
+void processJson(cJSON *json)
+{
+    if (json->type == cJSON_Object)
+    {
+        cJSON *item = json->child;
+        while (item)
+        {
+            if (strcmp(item->string, "Node Type") == 0)
+            {
+                if (strcmp(item->valuestring, "Seq Scan") == 0 || strcmp(item->valuestring, "Index Scan") == 0 ||
+                    strcmp(item->valuestring, "Index Only Scan") == 0 || strcmp(item->valuestring, "Bitmap Index Scan") == 0)
+                {
+                    cJSON *filnode = cJSON_GetObjectItem(json, "Filter");
+                    cJSON *relname = cJSON_GetObjectItem(json, "Relation Name");
+                    cJSON *aliname = cJSON_GetObjectItem(json, "Alias");
+                    char *subsql;
+                    if (relname)
+                    {
+                        if (!filnode)
+                        {
+                            // no filter
+                            size_t result_length = strlen("select * from ") + strlen(relname->valuestring) + 1;
+                            subsql = (char *)malloc(result_length);
+                            strcpy(subsql, "select * from ");
+                            strcat(subsql, relname->valuestring);
+                            //"select * from " "where"
+                        }
+                        else
+                        {
+                            if (aliname)
+                            {
+                                size_t result_length = strlen("select * from ") +
+                                                       strlen(relname->valuestring) + strlen(" as ") +
+                                                       strlen(aliname->valuestring) + strlen(" where ") +
+                                                       strlen(filnode->valuestring) + 1;
+                                subsql = (char *)malloc(result_length);
+                                strcpy(subsql, "select * from ");
+                                strcat(subsql, relname->valuestring);
+                                strcat(subsql, " as ");
+                                strcat(subsql, aliname->valuestring);
+                                strcat(subsql, " where ");
+                                strcat(subsql, filnode->valuestring);
+                            }
+                            else
+                            {
+                                size_t result_length = strlen("select * from ") +
+                                                       strlen(relname->valuestring) + strlen(" where ") + strlen(filnode->valuestring) + 1;
+                                subsql = (char *)malloc(result_length);
+                                strcpy(subsql, "select * from ");
+                                strcat(subsql, relname->valuestring);
+                                strcat(subsql, " where ");
+                                strcat(subsql, filnode->valuestring);
+                            }
+                        }
+                    }
+                    int scost = 0;
+                    int tcost = 0;
+                    int rows = 0;
+                    int width = 0;
+                    setGuc(item->valuestring, subsql, &scost, &tcost, &rows, &width);
+                    free(subsql);
+                    cJSON *cnode = cJSON_GetObjectItem(json, "Startup Cost");
+                    if (cnode)
+                    {
+                        cnode->valuedouble = scost;
+                    }
+                    cnode = cJSON_GetObjectItem(json, "Total Cost");
+                    if (cnode)
+                    {
+                        cnode->valuedouble = tcost;
+                    }
+                    cnode = cJSON_GetObjectItem(json, "Plan Rows");
+                    if (cnode)
+                    {
+                        cnode->valuedouble = rows;
+                    }
+                    cnode = cJSON_GetObjectItem(json, "Plan Width");
+                    if (cnode)
+                    {
+                        cnode->valuedouble = width;
+                    }
+                }
+            }
+
+            // 递归处理子节点
+            processJson(item);
+            item = item->next;
+        }
+    }
+    else if (json->type == cJSON_Array)
+    {
+        cJSON *item = json->child;
+        while (item)
+        {
+            processJson(item);
+            item = item->next;
+        }
     }
 }

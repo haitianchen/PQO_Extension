@@ -1,7 +1,7 @@
 # contrib/sr_plan/Makefile
 
 MODULE_big = sr_plan
-OBJS = sr_plan.o outfuncs_sr.o $(WIN32RES)
+OBJS = sr_plan.o outfuncs_sr.o cJSON.o $(WIN32RES)
 
 PGFILEDESC = "sr_plan - save and read plan"
 
