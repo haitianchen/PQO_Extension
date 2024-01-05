@@ -16,6 +16,8 @@
 #if PG_VERSION_NUM >= 100000
 #include "utils/queryenvironment.h"
 #include "catalog/index.h"
+#include "regex.h"
+
 #endif
 #include "catalog/pg_operator.h"
 #include "utils/syscache.h"
@@ -39,6 +41,20 @@ static char *ML_host = NULL;
 static int ML_port = 9381;
 static bool ML_enabled = false;
 static int sr_count = 2;
+
+typedef struct StrPair
+{
+    char *key;
+    char *value;
+} StrPair;
+
+typedef struct StrHashMap
+{
+    StrPair *pairs;
+    int size;
+    int capacity;
+} StrHashMap;
+
 typedef struct SrPlanCachedInfo
 {
     bool enabled;
@@ -53,7 +69,13 @@ typedef struct SrPlanCachedInfo
     Oid index_reloids_index_oid;
     const char *query_text;
 } SrPlanCachedInfo;
-
+typedef struct JoinCond
+{
+    char t1[50];
+    char c1[50];
+    char t2[50];
+    char c2[50];
+} JoinCond;
 typedef struct show_plan_funcctx
 {
     ExplainFormat format;
@@ -86,6 +108,7 @@ List *lookup_plan_by_query_hash_list(MemoryContext tmpctx, Snapshot snapshot, Re
                                      void *context,
                                      int index,
                                      char **queryString, int *count);
+JoinCond *GetJoinConds(const char *sql, int *num, MemoryContext _tm);
 static void sr_analyze(ParseState *pstate, Query *query);
 static Oid get_sr_plan_schema(void);
 static Oid sr_get_relname_oid(Oid schema_oid, const char *relname);
@@ -108,6 +131,12 @@ static int connect_to_ML(const char *host, int port);
 static void collect_indexid(void *context, Plan *plan);
 static bool
 sr_query_fake_const_walker(Node *node, void *context);
+StrHashMap *create_str_hash_map(void);
+void str_hash_map_insert(StrHashMap *map, const char *key, const char *value);
+const char *str_hash_map_lookup(StrHashMap *map, const char *key);
+char *get_json_plan_cost(PlannedStmt *pl_stmt);
+void bulidAliasMap(cJSON *json, StrHashMap *map);
+void processJson(cJSON *json, StrHashMap *map);
 struct QueryParam
 {
     int location;
@@ -764,6 +793,11 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
         level--;
         return pl_stmt;
     }
+    // char *testsql = "((web_sales.ws_sold_date_sk = 123.11) AND (c.c_customer_sk = web_sales.ws_bill_customer_sk))";
+    // int testnum = 0;
+    // JoinCond *jj = GetJoinConds(testsql, &testnum, CurrentMemoryContext);
+
+    //   StrHashMap *Hmap = create_str_hash_map();
 
     /* Make list with all _p functions and his position */
     sr_query_walker((Query *)parse, &qp_context);
@@ -801,10 +835,10 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
             foreach (plancell, plan_list)
             {
                 PlannedStmt *templan = (PlannedStmt *)lfirst(plancell);
-                char *tmp_plan_json = get_json_plan(templan);
+                // char *tmp_plan_json = get_json_plan(templan);
+                char *tmp_plan_json = get_json_plan_cost(templan);
                 appendStringInfo(plan_jsons, tmp_plan_json);
                 appendStringInfo(plan_jsons, syc_sign);
-                //
             }
             // send json to ml
             appendStringInfo(plan_jsons, syc_end);
@@ -828,6 +862,7 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
     }
     else
     {
+        tmpctx = CurrentMemoryContext;
         plan_list = lookup_plan_by_query_hash_list(tmpctx, snapshot, sr_index_rel, sr_plans_heap,
                                                    &key, &qp_context, 0, NULL, &tmp_query_count);
         if (list_length(plan_list) != 0)
@@ -1128,6 +1163,7 @@ cleanup:
     {
         pl_stmt = tmp_plan;
     }
+    get_json_plan_cost(pl_stmt);
     return pl_stmt;
 }
 
@@ -1860,13 +1896,28 @@ char *get_json_plan_cost(PlannedStmt *pl_stmt)
     ExplainEndOutput(es);
     json = pstrdup(es->str->data);
     cJSON *cjson = cJSON_Parse(json);
-
-    processJson(cjson);
+    StrHashMap *Hmap = create_str_hash_map();
+    bulidAliasMap(cjson, Hmap);
+    processJson(cjson, Hmap);
     char *jsonStr = cJSON_Print(cjson);
     // 释放内存
     cJSON_Delete(cjson);
 
     return jsonStr;
+}
+
+void execOneSubQuery(const char *sql, int *scost, int *tcost, int *rows, int *width)
+{
+    RawStmt *c_parsetree = lfirst_node(RawStmt, list_head(pg_parse_query(sql)));
+    List *c_querytree_list;
+    c_querytree_list = pg_analyze_and_rewrite(c_parsetree, sql,
+                                              NULL, 0, NULL);
+    Query *c_query = lfirst_node(Query, list_head(c_querytree_list));
+    PlannedStmt *c_plan = standard_planner(c_query, CURSOR_OPT_PARALLEL_OK, NULL);
+    *scost = c_plan->planTree->startup_cost;
+    *tcost = c_plan->planTree->total_cost;
+    *rows = c_plan->planTree->plan_rows;
+    *width = c_plan->planTree->plan_width;
 }
 const char *scanType[] = {"Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Index Scan", "Tid Scan"};
 const char *scanGUC[] = {"enable_seqscan", "enable_indexscan", "enable_indexonlyscan", "enable_bitmapscan", "enable_tidscan"};
@@ -1936,7 +1987,379 @@ void setGuc(char *scan_type, const char *sql, int *scost, int *tcost, int *rows,
 
     //  set_config_option("name", "true", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 }
-void processJson(cJSON *json)
+void precessNode(cJSON *json, cJSON *item, StrHashMap *map, cJSON *relnameForBitmap, cJSON *aliasForBitmap)
+{
+    char *subsql;
+
+    cJSON *condnode = NULL;
+    cJSON *aliname = NULL;
+    cJSON *filnode = cJSON_GetObjectItem(json, "Filter");
+
+    cJSON *relname = NULL;
+    if (relnameForBitmap != NULL && strcmp(item->valuestring, "Bitmap Index Scan") == 0)
+    {
+        relname = relnameForBitmap;
+    }
+    else
+    {
+        relname = cJSON_GetObjectItem(json, "Relation Name");
+    }
+    if (aliasForBitmap != NULL && strcmp(item->valuestring, "Bitmap Index Scan") == 0)
+    {
+        aliname = aliasForBitmap;
+    }
+    else
+    {
+        aliname = cJSON_GetObjectItem(json, "Alias");
+    }
+
+    if (strcmp(item->valuestring, "Bitmap Heap Scan") == 0)
+    {
+        condnode = cJSON_GetObjectItem(json, "Recheck Cond");
+        cJSON *subnode = cJSON_GetObjectItem(json, "Plans");
+        cJSON *Titem = subnode->child->child;
+        while (Titem != NULL)
+        {
+            if (strcmp(Titem->valuestring, "Bitmap Index Scan") == 0)
+            {
+                precessNode(subnode->child, Titem, map, relname, aliname);
+                break;
+            }
+            Titem = Titem->next;
+        }
+    }
+    else
+    {
+        condnode = cJSON_GetObjectItem(json, "Index Cond");
+    }
+    StrHashMap *tmpMap = create_str_hash_map();
+    size_t subsql_Len = 0;
+
+    subsql_Len += strlen("select * from ");
+
+    if (condnode != NULL)
+    {
+        int tmpnum = 0;
+        JoinCond *tmpJoinCond = GetJoinConds(condnode->valuestring, &tmpnum, CurrentMemoryContext);
+        for (int i = 0; i < tmpnum; i++)
+        {
+            if (str_hash_map_lookup(map, tmpJoinCond[i].t1) && str_hash_map_lookup(map, tmpJoinCond[i].t2))
+            {
+                str_hash_map_insert(tmpMap, str_hash_map_lookup(map, tmpJoinCond[i].t1), tmpJoinCond[i].t1);
+                str_hash_map_insert(tmpMap, str_hash_map_lookup(map, tmpJoinCond[i].t2), tmpJoinCond[i].t2);
+            }
+        }
+        subsql_Len += strlen(condnode->valuestring);
+    }
+    if (filnode != NULL)
+    {
+        subsql_Len += strlen(filnode->valuestring);
+    }
+    if (aliname != NULL)
+    {
+        str_hash_map_insert(tmpMap, relname->valuestring, aliname->valuestring);
+    }
+    else
+    {
+        str_hash_map_insert(tmpMap, relname->valuestring, "NOALIAS");
+    }
+    int iter = 0;
+    while (iter < tmpMap->size)
+    {
+        if (strcmp(tmpMap->pairs[iter].value, "NOALIAS"))
+        {
+            subsql_Len += strlen(tmpMap->pairs[iter].key);
+            subsql_Len += strlen(tmpMap->pairs[iter].value);
+            subsql_Len += strlen(" as ");
+        }
+        else
+        {
+            subsql_Len += strlen(tmpMap->pairs[iter].key);
+        }
+        subsql_Len += 1; // len of ,
+        iter++;
+    }
+    if (condnode != NULL && filnode != NULL)
+    {
+        subsql_Len += strlen(" and ");
+    }
+    if (condnode != NULL || filnode != NULL)
+    {
+        subsql_Len += strlen(" where ");
+    }
+    subsql = (char *)palloc(subsql_Len + 10);
+    strcpy(subsql, "select * from ");
+    iter = 0;
+    while (iter < tmpMap->size)
+    {
+        if (strcmp(tmpMap->pairs[iter].value, "NOALIAS"))
+        {
+
+            strcat(subsql, tmpMap->pairs[iter].key);
+            strcat(subsql, " as ");
+            strcat(subsql, tmpMap->pairs[iter].value);
+        }
+        else
+        {
+            strcat(subsql, tmpMap->pairs[iter].key);
+        }
+        if (iter < tmpMap->size - 1)
+        {
+            strcat(subsql, ",");
+        }
+        iter++;
+    }
+    if (condnode != NULL || filnode != NULL)
+    {
+        strcat(subsql, " where ");
+    }
+
+    if (condnode != NULL)
+    {
+        strcat(subsql, condnode->valuestring);
+    }
+    if (condnode != NULL && filnode != NULL)
+    {
+        strcat(subsql, " and ");
+    }
+    if (filnode != NULL)
+    {
+        strcat(subsql, filnode->valuestring);
+    }
+    strcat(subsql, ";");
+    int scost = 0;
+    int tcost = 0;
+    int rows = 0;
+    int width = 0;
+    execOneSubQuery(subsql, &scost, &tcost, &rows, &width);
+    //   free(subsql);
+    cJSON *cnode = cJSON_GetObjectItem(json, "Startup Cost");
+    if (cnode)
+    {
+        cnode->valuedouble = scost;
+    }
+    cnode = cJSON_GetObjectItem(json, "Total Cost");
+    if (cnode)
+    {
+        cnode->valuedouble = tcost;
+    }
+    cnode = cJSON_GetObjectItem(json, "Plan Rows");
+    if (cnode)
+    {
+        cnode->valuedouble = rows;
+    }
+    cnode = cJSON_GetObjectItem(json, "Plan Width");
+    if (cnode)
+    {
+        cnode->valuedouble = width;
+    }
+}
+
+void processJson(cJSON *json, StrHashMap *map)
+{
+    if (json->type == cJSON_Object)
+    {
+        cJSON *item = json->child;
+        while (item)
+        {
+
+            if (strcmp(item->string, "Node Type") == 0)
+            {
+                if (strcmp(item->valuestring, "Seq Scan") == 0 || strcmp(item->valuestring, "Index Scan") == 0 ||
+                    strcmp(item->valuestring, "Index Only Scan") == 0 || strcmp(item->valuestring, "Bitmap Heap Scan") == 0)
+                {
+                    precessNode(json, item, map, NULL, NULL);
+                }
+            }
+
+            // if (strcmp(item->string, "Node Type") == 0)
+            // {
+            //     if (strcmp(item->valuestring, "Seq Scan") == 0 || strcmp(item->valuestring, "Index Scan") == 0 ||
+            //         strcmp(item->valuestring, "Index Only Scan") == 0 || strcmp(item->valuestring, "Bitmap Index Scan") == 0)
+            //     {
+            //         cJSON *filnode = cJSON_GetObjectItem(json, "Filter");
+            //         cJSON *relname = cJSON_GetObjectItem(json, "Relation Name");
+            //         cJSON *aliname = cJSON_GetObjectItem(json, "Alias");
+            //         char *subsql;
+            //         if (relname)
+            //         {
+            //             if (!filnode)
+            //             {
+            //                 // no filter
+            //                 size_t result_length = strlen("select * from ") + strlen(relname->valuestring) + 1;
+            //                 subsql = (char *)palloc(result_length);
+            //                 strcpy(subsql, "select * from ");
+            //                 strcat(subsql, relname->valuestring);
+            //                 //"select * from " "where"
+            //             }
+            //             else
+            //             {
+            //                 if (aliname)
+            //                 {
+            //                     size_t result_length = strlen("select * from ") +
+            //                                            strlen(relname->valuestring) + strlen(" as ") +
+            //                                            strlen(aliname->valuestring) + strlen(" where ") +
+            //                                            strlen(filnode->valuestring) + 1;
+            //                     subsql = (char *)palloc(result_length);
+            //                     strcpy(subsql, "select * from ");
+            //                     strcat(subsql, relname->valuestring);
+            //                     strcat(subsql, " as ");
+            //                     strcat(subsql, aliname->valuestring);
+            //                     strcat(subsql, " where ");
+            //                     strcat(subsql, filnode->valuestring);
+            //                 }
+            //                 else
+            //                 {
+            //                     size_t result_length = strlen("select * from ") +
+            //                                            strlen(relname->valuestring) + strlen(" where ") + strlen(filnode->valuestring) + 1;
+            //                     subsql = (char *)palloc(result_length);
+            //                     strcpy(subsql, "select * from ");
+            //                     strcat(subsql, relname->valuestring);
+            //                     strcat(subsql, " where ");
+            //                     strcat(subsql, filnode->valuestring);
+            //                 }
+            //             }
+            //         }
+            //         int scost = 0;
+            //         int tcost = 0;
+            //         int rows = 0;
+            //         int width = 0;
+            //         setGuc(item->valuestring, subsql, &scost, &tcost, &rows, &width);
+            //         //   free(subsql);
+            //         cJSON *cnode = cJSON_GetObjectItem(json, "Startup Cost");
+            //         if (cnode)
+            //         {
+            //             cnode->valuedouble = scost;
+            //         }
+            //         cnode = cJSON_GetObjectItem(json, "Total Cost");
+            //         if (cnode)
+            //         {
+            //             cnode->valuedouble = tcost;
+            //         }
+            //         cnode = cJSON_GetObjectItem(json, "Plan Rows");
+            //         if (cnode)
+            //         {
+            //             cnode->valuedouble = rows;
+            //         }
+            //         cnode = cJSON_GetObjectItem(json, "Plan Width");
+            //         if (cnode)
+            //         {
+            //             cnode->valuedouble = width;
+            //         }
+            //     }
+            // }
+
+            // 递归处理子节点
+            processJson(item, map);
+            item = item->next;
+        }
+    }
+    else if (json->type == cJSON_Array)
+    {
+        cJSON *item = json->child;
+        while (item)
+        {
+            processJson(item, map);
+            item = item->next;
+        }
+    }
+}
+
+JoinCond *GetJoinConds(const char *sql, int *num, MemoryContext _tm)
+{
+    regex_t regex;
+    regmatch_t pmatch[5];
+    const char *pattern = "([[:alnum:]_]+)\.([[:alnum:]_]+)[[:space:]]*=[[:space:]]*([[:alnum:]_]+)\.([[:alnum:]_]+)";
+    int reti = regcomp(&regex, pattern, REG_EXTENDED);
+    if (reti)
+    {
+        fprintf(stderr, "Could not compile regex\n");
+        exit(1);
+    }
+
+    const char *p = sql;
+    JoinCond *join_conds = NULL;
+    *num = 0;
+    MemoryContext _od = CurrentMemoryContext;
+    while (regexec(&regex, p, 5, pmatch, 0) == 0)
+    {
+        MemoryContextSwitchTo(_tm);
+        if (join_conds == NULL)
+        {
+            join_conds = palloc(sizeof(JoinCond));
+        }
+        else
+        {
+            join_conds = repalloc(join_conds, (*num + 1) * sizeof(JoinCond));
+        }
+        MemoryContextSwitchTo(_od);
+        int len = pmatch[1].rm_eo - pmatch[1].rm_so;
+        strncpy(join_conds[*num].t1, p + pmatch[1].rm_so, len);
+        join_conds[*num].t1[len] = '\0';
+
+        len = pmatch[2].rm_eo - pmatch[2].rm_so;
+        strncpy(join_conds[*num].c1, p + pmatch[2].rm_so, len);
+        join_conds[*num].c1[len] = '\0';
+
+        len = pmatch[3].rm_eo - pmatch[3].rm_so;
+        strncpy(join_conds[*num].t2, p + pmatch[3].rm_so, len);
+        join_conds[*num].t2[len] = '\0';
+
+        len = pmatch[4].rm_eo - pmatch[4].rm_so;
+        strncpy(join_conds[*num].c2, p + pmatch[4].rm_so, len);
+        join_conds[*num].c2[len] = '\0';
+
+        (*num)++;
+        p += pmatch[0].rm_eo;
+    }
+
+    regfree(&regex);
+    return join_conds;
+}
+StrHashMap *create_str_hash_map(void)
+{
+    StrHashMap *map = (StrHashMap *)palloc(sizeof(StrHashMap));
+    map->pairs = (StrPair *)palloc(sizeof(StrPair) * 10);
+    map->size = 0;
+    map->capacity = 10;
+    return map;
+}
+
+void str_hash_map_insert(StrHashMap *map, const char *key, const char *value)
+{
+    for (int i = 0; i < map->size; i++)
+    {
+        if (strcmp(map->pairs[i].key, key) == 0)
+        {
+            // Key already exists, update the value
+            map->pairs[i].value = pstrdup(value);
+            return;
+        }
+    }
+
+    if (map->size == map->capacity)
+    {
+        map->capacity *= 2;
+        map->pairs = (StrPair *)repalloc(map->pairs, sizeof(StrPair) * map->capacity);
+    }
+    map->pairs[map->size].key = pstrdup(key);
+    map->pairs[map->size].value = pstrdup(value);
+    map->size++;
+}
+
+const char *str_hash_map_lookup(StrHashMap *map, const char *key)
+{
+    for (int i = 0; i < map->size; i++)
+    {
+        if (strcmp(map->pairs[i].key, key) == 0)
+        {
+            return map->pairs[i].value;
+        }
+    }
+    return NULL;
+}
+
+void bulidAliasMap(cJSON *json, StrHashMap *map)
 {
     if (json->type == cJSON_Object)
     {
@@ -1946,82 +2369,23 @@ void processJson(cJSON *json)
             if (strcmp(item->string, "Node Type") == 0)
             {
                 if (strcmp(item->valuestring, "Seq Scan") == 0 || strcmp(item->valuestring, "Index Scan") == 0 ||
-                    strcmp(item->valuestring, "Index Only Scan") == 0 || strcmp(item->valuestring, "Bitmap Index Scan") == 0)
+                    strcmp(item->valuestring, "Index Only Scan") == 0)
                 {
-                    cJSON *filnode = cJSON_GetObjectItem(json, "Filter");
                     cJSON *relname = cJSON_GetObjectItem(json, "Relation Name");
                     cJSON *aliname = cJSON_GetObjectItem(json, "Alias");
-                    char *subsql;
-                    if (relname)
+                    if (aliname)
                     {
-                        if (!filnode)
-                        {
-                            // no filter
-                            size_t result_length = strlen("select * from ") + strlen(relname->valuestring) + 1;
-                            subsql = (char *)malloc(result_length);
-                            strcpy(subsql, "select * from ");
-                            strcat(subsql, relname->valuestring);
-                            //"select * from " "where"
-                        }
-                        else
-                        {
-                            if (aliname)
-                            {
-                                size_t result_length = strlen("select * from ") +
-                                                       strlen(relname->valuestring) + strlen(" as ") +
-                                                       strlen(aliname->valuestring) + strlen(" where ") +
-                                                       strlen(filnode->valuestring) + 1;
-                                subsql = (char *)malloc(result_length);
-                                strcpy(subsql, "select * from ");
-                                strcat(subsql, relname->valuestring);
-                                strcat(subsql, " as ");
-                                strcat(subsql, aliname->valuestring);
-                                strcat(subsql, " where ");
-                                strcat(subsql, filnode->valuestring);
-                            }
-                            else
-                            {
-                                size_t result_length = strlen("select * from ") +
-                                                       strlen(relname->valuestring) + strlen(" where ") + strlen(filnode->valuestring) + 1;
-                                subsql = (char *)malloc(result_length);
-                                strcpy(subsql, "select * from ");
-                                strcat(subsql, relname->valuestring);
-                                strcat(subsql, " where ");
-                                strcat(subsql, filnode->valuestring);
-                            }
-                        }
+                        str_hash_map_insert(map, aliname->valuestring, relname->valuestring);
                     }
-                    int scost = 0;
-                    int tcost = 0;
-                    int rows = 0;
-                    int width = 0;
-                    setGuc(item->valuestring, subsql, &scost, &tcost, &rows, &width);
-                    free(subsql);
-                    cJSON *cnode = cJSON_GetObjectItem(json, "Startup Cost");
-                    if (cnode)
+                    else
                     {
-                        cnode->valuedouble = scost;
-                    }
-                    cnode = cJSON_GetObjectItem(json, "Total Cost");
-                    if (cnode)
-                    {
-                        cnode->valuedouble = tcost;
-                    }
-                    cnode = cJSON_GetObjectItem(json, "Plan Rows");
-                    if (cnode)
-                    {
-                        cnode->valuedouble = rows;
-                    }
-                    cnode = cJSON_GetObjectItem(json, "Plan Width");
-                    if (cnode)
-                    {
-                        cnode->valuedouble = width;
+                        str_hash_map_insert(map, relname->valuestring, "NOALIAS");
                     }
                 }
             }
 
             // 递归处理子节点
-            processJson(item);
+            bulidAliasMap(item, map);
             item = item->next;
         }
     }
@@ -2030,7 +2394,7 @@ void processJson(cJSON *json)
         cJSON *item = json->child;
         while (item)
         {
-            processJson(item);
+            bulidAliasMap(item, map);
             item = item->next;
         }
     }
