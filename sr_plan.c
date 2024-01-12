@@ -17,7 +17,7 @@
 #include "utils/queryenvironment.h"
 #include "catalog/index.h"
 #include "regex.h"
-
+#include "nodes/parsenodes.h"
 #endif
 #include "catalog/pg_operator.h"
 #include "utils/syscache.h"
@@ -719,7 +719,30 @@ List *lookup_plan_by_query_hash_list(MemoryContext tmpctx, Snapshot snapshot, Re
     ExecDropSingleTupleTableSlot(slot);
 #endif
 }
+void traverseRTable(Query *query, bool *flag)
+{
+    ListCell *lc;
 
+    foreach (lc, query->rtable)
+    {
+        RangeTblEntry *rte = (RangeTblEntry *)lfirst(lc);
+
+        if (rte->rtekind == RTE_RELATION)
+        {
+            char *schemaName = get_namespace_name(get_rel_namespace(rte->relid));
+            if (schemaName != NULL && strcmp(schemaName, "pg_catalog") == 0)
+            {
+                *flag = true;
+                return;
+            }
+        }
+        else if (rte->rtekind == RTE_SUBQUERY)
+        {
+            // Recursively traverse the rtable of the subquery
+            traverseRTable(rte->subquery, flag);
+        }
+    }
+}
 /* planner_hook */
 static PlannedStmt *
 #if PG_VERSION_NUM >= 130000
@@ -767,7 +790,17 @@ sr_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 #endif
 
     /* Only save plans for SELECT commands */
-    if (parse->commandType != CMD_SELECT || !cachedInfo.enabled || cachedInfo.explain_query)
+    bool flag = false;
+    traverseRTable(parse, &flag);
+    if (flag)
+    {
+        pl_stmt = call_standard_planner();
+        level--;
+        return pl_stmt;
+    }
+
+    // if (parse->commandType != CMD_SELECT || !cachedInfo.enabled || cachedInfo.explain_query)
+    if (parse->commandType != CMD_SELECT || !cachedInfo.enabled)
     {
         pl_stmt = call_standard_planner();
         level--;
